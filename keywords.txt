@@ -1,0 +1,19 @@
+#######################################
+# Syntax Coloring Map for BlipCode16
+#######################################
+
+#######################################
+# Datatypes (KEYWORD1)
+#######################################
+
+BlipCode16	KEYWORD1
+BlipCode16Result	KEYWORD1
+BlipCode16Point	KEYWORD1
+
+#######################################
+# Methods and Functions (KEYWORD2)
+#######################################
+
+decode	KEYWORD2
+setBandHeightFraction	KEYWORD2
+getBandHeightFraction	KEYWORD2
