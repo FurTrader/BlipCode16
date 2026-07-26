@@ -37,8 +37,8 @@
  *     Serial.println(results[i].value); // 0-15
  *   }
  *
- * See examples/ESP32CAM_BlipCode16_example for a full sketch using the
- * ESP32 camera driver directly.
+ * See examples/ESP32CAM_BlipCode16 for a full sketch using the ESP32
+ * camera driver directly.
  *
  * ---------------------------------------------------------------------
  * IMAGE FORMAT
@@ -76,10 +76,11 @@
 #include <Arduino.h>
 
 // ---------------------------------------------------------------------
-// Compile-time buffer sizing. These are stack/member scratch buffers
-// sized generously for common ESP32-CAM resolutions -- override by
-// #define-ing before #include <BlipCode16.h> if you need more headroom
-// (e.g. a taller vertical band on a high-resolution sensor).
+// Compile-time tuning: scratch buffer sizes, plus
+// BLIPCODE16_THRESHOLD_CANDIDATES (a real compute-cost knob, not a
+// buffer size -- lower it if decode() is too slow for your hardware,
+// at some cost to robustness in harsh/mixed lighting; see README).
+// Override any of these by #define-ing before #include <BlipCode16.h>.
 // ---------------------------------------------------------------------
 
 #ifndef BLIPCODE16_MAX_COLUMN_HEIGHT
@@ -94,7 +95,9 @@
 #define BLIPCODE16_MAX_RAW_MATCHES 32  ///< Max confirmed-but-not-yet-merged clusters per frame.
 #endif
 
+#ifndef BLIPCODE16_THRESHOLD_CANDIDATES
 #define BLIPCODE16_THRESHOLD_CANDIDATES 9  ///< Percentile thresholds tried per column (10%..90%).
+#endif
 #define BLIPCODE16_BARS_TOTAL 6            ///< 2 sync + 4 data bars. Fixed; see README to change.
 #define BLIPCODE16_SYNC_BARS 2
 
