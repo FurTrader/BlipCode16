@@ -206,11 +206,12 @@ bool BlipCode16::tryMatchFrom(const Run *runs, uint8_t runCount,
 }
 
 // ---------------------------------------------------------------------
-// Tries every candidate threshold in turn, and within each, every
-// possible start position -- i.e. the "exactly 6 dark bands in valid
-// proportion" structure IS the selection criterion for which threshold
-// is correct for this column, rather than committing to one threshold
-// upfront. Returns on the first full match found.
+// Tries the locked threshold (if any) first, then every candidate
+// threshold in turn, and within each, every possible start position --
+// i.e. the "exactly 6 dark bands in valid proportion" structure IS the
+// selection criterion for which threshold is correct for this column,
+// rather than committing to one threshold upfront. Returns on the first
+// full match found.
 // ---------------------------------------------------------------------
 bool BlipCode16::tryDecodeColumn(const uint8_t *image, uint16_t width,
                                   uint16_t bandY, uint16_t bandHeight,
@@ -218,19 +219,48 @@ bool BlipCode16::tryDecodeColumn(const uint8_t *image, uint16_t width,
   uint8_t colMin, colMax;
   buildColumnAndHistogram(image, width, bandY, bandHeight, x, _columnBuf,
                            _histogram, &colMin, &colMax);
-  if ((uint16_t)(colMax - colMin) < minColumnContrast) return false;
+  if ((uint16_t)(colMax - colMin) < minColumnContrast) {
+    _hasLockedThreshold = false; // this column found nothing at all; drop any lock
+    return false;
+  }
+
+  // Fast path: adjacent columns of the same physical target under the
+  // same lighting almost always share a working threshold, so try
+  // whatever worked last before paying for the full multi-candidate
+  // search again. No point re-searching once we already know a value
+  // that works here.
+  if (_hasLockedThreshold) {
+    uint8_t runCount = runsAtThreshold(_columnBuf, bandHeight, _lockedThreshold,
+                                        _runs, BLIPCODE16_MAX_RUNS);
+    for (uint8_t start = 0; start < runCount; start++) {
+      if (tryMatchFrom(_runs, runCount, start, x, out)) return true; // lock still good
+    }
+    // Locked threshold didn't work for this column -- fall through to a
+    // full search rather than giving up (lock only gets cleared below if
+    // the full search ALSO fails).
+  }
+
+  uint8_t candidateCount = thresholdCandidates;
+  if (candidateCount > BLIPCODE16_THRESHOLD_CANDIDATES) {
+    candidateCount = BLIPCODE16_THRESHOLD_CANDIDATES; // can't exceed the array's compile-time size
+  }
 
   uint8_t thresholds[BLIPCODE16_THRESHOLD_CANDIDATES];
-  candidateThresholds(_histogram, bandHeight, thresholds,
-                       BLIPCODE16_THRESHOLD_CANDIDATES);
+  candidateThresholds(_histogram, bandHeight, thresholds, candidateCount);
 
-  for (uint8_t t = 0; t < BLIPCODE16_THRESHOLD_CANDIDATES; t++) {
+  for (uint8_t t = 0; t < candidateCount; t++) {
     uint8_t runCount = runsAtThreshold(_columnBuf, bandHeight, thresholds[t],
                                         _runs, BLIPCODE16_MAX_RUNS);
     for (uint8_t start = 0; start < runCount; start++) {
-      if (tryMatchFrom(_runs, runCount, start, x, out)) return true;
+      if (tryMatchFrom(_runs, runCount, start, x, out)) {
+        _lockedThreshold = thresholds[t]; // lock onto whatever just worked
+        _hasLockedThreshold = true;
+        return true;
+      }
     }
   }
+
+  _hasLockedThreshold = false; // total failure at this column; drop the lock
   return false;
 }
 
@@ -246,6 +276,33 @@ uint8_t BlipCode16::decode(const uint8_t *image, uint16_t width,
   uint16_t coarseStep = width / coarseSamples;
   if (coarseStep < 1) coarseStep = 1;
 
+  // Center-out coarse sample order: the target is usually near the
+  // aim/reticle center, so checking there first (and working outward)
+  // finds it faster on average than a fixed left-to-right sweep, while
+  // still covering the same set of positions overall. This also means
+  // maxResults=1 effectively returns "whichever confirmed code is
+  // closest to center" rather than "whichever is leftmost".
+  int16_t coarseX[BLIPCODE16_MAX_COARSE_SAMPLES];
+  uint16_t coarseCount = 0;
+  {
+    int32_t center = ((int32_t)width / 2 / coarseStep) * coarseStep;
+    if (coarseCount < BLIPCODE16_MAX_COARSE_SAMPLES) coarseX[coarseCount++] = (int16_t)center;
+
+    int32_t left = center - coarseStep;
+    int32_t right = center + coarseStep;
+    bool takeLeft = true;
+    while ((left >= 0 || right < width) && coarseCount < BLIPCODE16_MAX_COARSE_SAMPLES) {
+      if (takeLeft) {
+        if (left >= 0) { coarseX[coarseCount++] = (int16_t)left; left -= coarseStep; }
+        else if (right < width) { coarseX[coarseCount++] = (int16_t)right; right += coarseStep; }
+      } else {
+        if (right < width) { coarseX[coarseCount++] = (int16_t)right; right += coarseStep; }
+        else if (left >= 0) { coarseX[coarseCount++] = (int16_t)left; left -= coarseStep; }
+      }
+      takeLeft = !takeLeft;
+    }
+  }
+
   // Coarse scan + adjacent-column confirmation. A confirmed cluster here
   // is one physical detection event -- the same real code can still
   // produce more than one cluster if it spans wider than one confirm
@@ -253,12 +310,32 @@ uint8_t BlipCode16::decode(const uint8_t *image, uint16_t width,
   ConfirmedMatch rawMatches[BLIPCODE16_MAX_RAW_MATCHES];
   uint8_t rawCount = 0;
 
-  for (int32_t x = 0; x < width && rawCount < BLIPCODE16_MAX_RAW_MATCHES; x += coarseStep) {
+  bool valueSeen[16] = {false};
+  uint8_t distinctSeen = 0;
+
+  for (uint16_t ci = 0; ci < coarseCount && rawCount < BLIPCODE16_MAX_RAW_MATCHES; ci++) {
+    int16_t x = coarseX[ci];
+
+    // Skip columns already covered by a previously confirmed match's
+    // neighborhood. This replaces the old single-direction "x +=
+    // confirmMaxMisses" skip-ahead, which doesn't translate cleanly to a
+    // bidirectional center-out scan order -- a simple range check against
+    // already-confirmed clusters works regardless of scan order.
+    bool alreadyCovered = false;
+    for (uint8_t m = 0; m < rawCount; m++) {
+      if (x >= rawMatches[m].minX - (int16_t)confirmMaxMisses &&
+          x <= rawMatches[m].maxX + (int16_t)confirmMaxMisses) {
+        alreadyCovered = true;
+        break;
+      }
+    }
+    if (alreadyCovered) continue;
+
     ColumnMatch hit;
-    if (!tryDecodeColumn(image, width, bandY, bandHeight, (int16_t)x, &hit)) continue;
+    if (!tryDecodeColumn(image, width, bandY, bandHeight, x, &hit)) continue;
 
     uint8_t confirmCount = 0;
-    int16_t minX = (int16_t)x, maxX = (int16_t)x;
+    int16_t minX = x, maxX = x;
     for (uint8_t d = 1; d <= confirmMaxMisses; d++) {
       int32_t candidates[2] = { x + d, x - d };
       for (uint8_t c = 0; c < 2; c++) {
@@ -281,7 +358,17 @@ uint8_t BlipCode16::decode(const uint8_t *image, uint16_t width,
       rawMatches[rawCount].minX = minX;
       rawMatches[rawCount].maxX = maxX;
       rawCount++;
-      x += confirmMaxMisses; // skip past this cluster's neighborhood
+
+      if (!valueSeen[hit.value]) {
+        valueSeen[hit.value] = true;
+        distinctSeen++;
+      }
+      // Caller only wants maxResults distinct codes -- once we have that
+      // many, further scanning is wasted work. Note this means decode()
+      // no longer always scans the full frame when maxResults is small;
+      // previously it always scanned everything and only truncated
+      // output at the very end.
+      if (distinctSeen >= maxResults) break;
     }
   }
 

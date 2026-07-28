@@ -96,10 +96,14 @@
 #endif
 
 #ifndef BLIPCODE16_THRESHOLD_CANDIDATES
-#define BLIPCODE16_THRESHOLD_CANDIDATES 9  ///< Percentile thresholds tried per column (10%..90%).
+#define BLIPCODE16_THRESHOLD_CANDIDATES 9  ///< Compile-time CEILING for the thresholdCandidates field below (array size) -- change the field itself at runtime, not this.
 #endif
 #define BLIPCODE16_BARS_TOTAL 6            ///< 2 sync + 4 data bars. Fixed; see README to change.
 #define BLIPCODE16_SYNC_BARS 2
+
+#ifndef BLIPCODE16_MAX_COARSE_SAMPLES
+#define BLIPCODE16_MAX_COARSE_SAMPLES 256  ///< Array size backing the center-out coarse scan order; must exceed coarseSamples.
+#endif
 
 /** A single (x, y) pixel coordinate in the source image. */
 struct BlipCode16Point {
@@ -167,6 +171,25 @@ public:
   uint8_t coarseSamples = 80;
 
   /**
+   * Number of percentile threshold candidates actually tried per column
+   * (see the multi-threshold matching explanation in the README) --
+   * runtime-settable, e.g. `reader.thresholdCandidates = 3;`. This is the
+   * single biggest speed/robustness tradeoff available: fewer candidates
+   * is faster but less tolerant of harsh/mixed lighting.
+   *
+   * NOTE: earlier versions of this library used a compile-time
+   * #define for this (BLIPCODE16_THRESHOLD_CANDIDATES), which only
+   * worked if you edited BlipCode16.h directly -- a #define in your own
+   * sketch before #include <BlipCode16.h> has no effect, since
+   * BlipCode16.cpp is a separate translation unit that never sees your
+   * sketch's preprocessor definitions. This field replaces that. The
+   * macro still exists, but now only as the compile-time ceiling (array
+   * size) this field is clamped to -- raise BLIPCODE16_THRESHOLD_CANDIDATES
+   * itself only if you want to allow MORE than 9 candidates at runtime.
+   */
+  uint8_t thresholdCandidates = BLIPCODE16_THRESHOLD_CANDIDATES;
+
+  /**
    * Scans `image` (grayscale, `width` x `height`, row-major, no padding)
    * for BlipCode16 targets, writing up to `maxResults` decoded targets
    * into `results`. Multiple confirmed detections of the same value are
@@ -174,14 +197,38 @@ public:
    * count is the number of DISTINCT codes found, not the number of raw
    * detections.
    *
+   * Stops scanning as soon as `maxResults` distinct codes have been
+   * confirmed -- e.g. maxResults=1 returns after the first confirmed
+   * code rather than scanning the rest of the frame for others. Scan
+   * order is center-out (see coarseSamples), so with maxResults=1 this
+   * also means "closest to center wins" in the common case where the
+   * target is near the aim point.
+   *
    * Returns the number of results written (0 if nothing was found).
-   * Safe to call every frame; keeps no state between calls.
+   * Safe to call every frame; keeps no state between calls EXCEPT the
+   * threshold lock (see thresholdCandidates' sibling optimization,
+   * documented in the .cpp) which persists across calls by design.
    */
   uint8_t decode(const uint8_t *image, uint16_t width, uint16_t height,
                  BlipCode16Result *results, uint8_t maxResults);
 
 private:
   float _bandHeightFrac = 1.0f;
+
+  // Threshold lock: once a column succeeds at a specific threshold,
+  // subsequent columns try that exact value FIRST before falling back to
+  // the full multi-candidate search -- adjacent columns of the same
+  // physical target under the same lighting almost always share a
+  // working threshold, so this turns most of a scan into single-threshold
+  // attempts instead of thresholdCandidates-many. Persists across
+  // decode() calls (frames), not just within one -- lighting is usually
+  // similar frame-to-frame, and a stale lock only costs one quick failed
+  // attempt before falling back, so there's no real downside to carrying
+  // it over. Cleared on any column that fails to find a result at all
+  // (contrast too low OR no valid structural match), per the same "lock
+  // until failure" rule that governs when a NEW lock gets set.
+  bool _hasLockedThreshold = false;
+  uint8_t _lockedThreshold = 0;
 
   struct Run {
     bool black;
